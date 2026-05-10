@@ -1,0 +1,170 @@
+name: Build & Release FewMB
+
+on:
+  push:
+    branches: [main, develop]
+    tags:     ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      upload_artifact:
+        description: 'Upload build artifact'
+        required: false
+        default: 'true'
+
+# Cancel in-progress runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT:    FewMB
+  BUILD_TYPE: Release
+  WV2_PKG:    Microsoft.Web.WebView2
+
+jobs:
+  # ─── Build ──────────────────────────────────────────────────────────────────
+  build:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for tag-based versioning
+
+      # ── Tool setup ──────────────────────────────────────────────────────────
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      # ── WebView2 SDK via NuGet ───────────────────────────────────────────────
+      - name: Install WebView2 SDK
+        shell: pwsh
+        run: |
+          nuget install ${{ env.WV2_PKG }} -OutputDirectory packages -NonInteractive
+          $wv2Root = (Get-ChildItem packages -Filter "${{ env.WV2_PKG }}.*" | Select-Object -First 1).FullName
+          $wv2Inc  = "$wv2Root\build\native\include"
+          $wv2Lib  = "$wv2Root\build\native\x64"
+          echo "WV2_INCLUDE=$wv2Inc" >> $env:GITHUB_ENV
+          echo "WV2_LIB=$wv2Lib"     >> $env:GITHUB_ENV
+          echo "WV2_ROOT=$wv2Root"    >> $env:GITHUB_ENV
+
+      # ── Configure ────────────────────────────────────────────────────────────
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_INCLUDE_PATH="${{ env.WV2_INCLUDE }}" `
+            -DCMAKE_LIBRARY_PATH="${{ env.WV2_LIB }}"
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build `
+            --config ${{ env.BUILD_TYPE }} `
+            --parallel $env:NUMBER_OF_PROCESSORS `
+            -- /p:MultiProcessorCompilation=true
+
+      # ── Binary size check ────────────────────────────────────────────────────
+      - name: Check binary size (1 MB target)
+        shell: pwsh
+        run: |
+          $exe  = Get-Item "build\bin\${{ env.BUILD_TYPE }}\${{ env.PROJECT }}.exe"
+          $mb   = [math]::Round($exe.Length / 1MB, 3)
+          $kb   = [math]::Round($exe.Length / 1KB, 1)
+          Write-Host "Binary size: $kb KB ($mb MB)"
+          if ($exe.Length -gt 1MB) {
+            Write-Warning "Binary exceeds 1 MB target ($mb MB). Check /OPT:REF /OPT:ICF /GL flags."
+          } else {
+            Write-Host "Under 1 MB target"
+          }
+          echo "BINARY_SIZE_KB=$kb" >> $env:GITHUB_ENV
+          echo "BINARY_SIZE_MB=$mb" >> $env:GITHUB_ENV
+
+      # ── Stage release package ────────────────────────────────────────────────
+      - name: Stage release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "build\bin\${{ env.BUILD_TYPE }}\${{ env.PROJECT }}.exe" dist\
+
+          # Copy WebView2Loader.dll (runtime requirement)
+          $loader = "${{ env.WV2_LIB }}\WebView2Loader.dll"
+          if (Test-Path $loader) { Copy-Item $loader dist\ }
+
+          Compress-Archive -Path dist\* `
+            -DestinationPath "${{ env.PROJECT }}-Windows-x64.zip" `
+            -CompressionLevel Optimal -Force
+
+          $zipSz = [math]::Round((Get-Item "${{ env.PROJECT }}-Windows-x64.zip").Length / 1KB, 1)
+          Write-Host "Package: ${{ env.PROJECT }}-Windows-x64.zip ($zipSz KB)"
+
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload artifact
+        if: |
+          github.event_name != 'pull_request' ||
+          github.event.inputs.upload_artifact == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT }}-Windows-x64
+          path: ${{ env.PROJECT }}-Windows-x64.zip
+          retention-days: 30
+
+      # ── Build summary ────────────────────────────────────────────────────────
+      - name: Write build summary
+        if: always()
+        shell: pwsh
+        run: |
+          $md = @"
+          ## Build Summary
+          | Field | Value |
+          |---|---|
+          | Ref | ${{ github.ref_name }} |
+          | SHA | ${{ github.sha }} |
+          | Binary | $env:BINARY_SIZE_KB KB ($env:BINARY_SIZE_MB MB) |
+          "@
+          $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+  # ─── Release (tag push only) ─────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PROJECT }}-Windows-x64
+          path: dist
+
+      - name: Extract changelog for this tag
+        id: changelog
+        run: |
+          TAG="${{ github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FewMB ${{ steps.changelog.outputs.tag }}
+          tag_name: ${{ github.ref_name }}
+          files: dist/${{ env.PROJECT }}-Windows-x64.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
